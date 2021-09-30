@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 from cereal import car
+from common.numpy_fast import interp
 from selfdrive.config import Conversions as CV
 from selfdrive.car.gm.values import CAR, Ecu, ECU_FINGERPRINT, CruiseButtons, AccState, FINGERPRINTS
 from selfdrive.car import STD_CARGO_KG, scale_rot_inertia, scale_tire_stiffness, is_ecu_disconnected, gen_empty_fingerprint
 from selfdrive.car.interfaces import CarInterfaceBase
 
+FOLLOW_AGGRESSION = 0.15 # (Acceleration/Decel aggression) Lower is more aggressive
+
+
 ButtonType = car.CarState.ButtonEvent.Type
 EventName = car.CarEvent.EventName
 
 class CarInterface(CarInterfaceBase):
-
   @staticmethod
   def compute_gb(accel, speed):
     return float(accel) / 4.0
@@ -39,6 +42,8 @@ class CarInterface(CarInterfaceBase):
     ret.lateralTuning.pid.kf = 0.00004   # full torque for 20 deg at 80mph means 0.00007818594
     ret.steerRateCost = 0.8
     ret.steerActuatorDelay = 0.1  # Default delay, not measured yet
+
+    ret.doManualSNG = False
 
     if candidate == CAR.VOLT:
       # supports stop and go, but initial engage must be above 18mph (which include conservatism)
@@ -154,9 +159,15 @@ class CarInterface(CarInterfaceBase):
 
     ret = self.CS.update(self.cp)
 
-    ret.cruiseState.enabled = self.CS.main_on
+    cruiseEnabled = self.CS.pcm_acc_status != AccState.OFF
+    ret.cruiseState.enabled = cruiseEnabled
+
+    ret.readdistancelines = self.CS.follow_level
+
     ret.canValid = self.cp.can_valid
     ret.steeringRateLimited = self.CC.steer_rate_limited if self.CC is not None else False
+
+    ret.engineRPM = self.CS.engineRPM
 
     buttonEvents = []
 
@@ -170,8 +181,11 @@ class CarInterface(CarInterfaceBase):
         be.pressed = False
         but = self.CS.prev_cruise_buttons
       if but == CruiseButtons.RES_ACCEL:
-        be.type = ButtonType.accelCruise
+        if not (ret.cruiseState.enabled and ret.standstill):
+          be.type = ButtonType.accelCruise  # Suppress resume button if we're resuming from stop so we don't adjust speed.
       elif but == CruiseButtons.DECEL_SET:
+        if not cruiseEnabled and not self.CS.lkMode:
+          self.lkMode = True
         be.type = ButtonType.decelCruise
       elif but == CruiseButtons.CANCEL:
         be.type = ButtonType.cancel
@@ -181,15 +195,54 @@ class CarInterface(CarInterfaceBase):
 
     ret.buttonEvents = buttonEvents
 
-    events = self.create_common_events(ret)
+    if cruiseEnabled and self.CS.lka_button and self.CS.lka_button != self.CS.prev_lka_button:
+      self.CS.lkMode = not self.CS.lkMode
+
+    if self.CS.distance_button and self.CS.distance_button != self.CS.prev_distance_button:
+       self.CS.follow_level -= 1
+       if self.CS.follow_level < 1:
+         self.CS.follow_level = 3
+
+    events = self.create_common_events(ret, pcm_enable=False)
 
     if ret.vEgo < self.CP.minEnableSpeed:
       events.add(EventName.belowEngageSpeed)
     if self.CS.park_brake:
       events.add(EventName.parkBrake)
+    if self.CS.pcm_acc_status == AccState.FAULTED:
+      events.add(EventName.controlsFailed)
     if ret.vEgo < self.CP.minSteerSpeed:
       events.add(car.CarEvent.EventName.belowSteerSpeed)
+    if self.CS.autoHoldActivated:
+      events.add(car.CarEvent.EventName.autoHoldActivated)
+    # handle button presses
+    for b in ret.buttonEvents:
+      # do enable on both accel and decel buttons
+      if b.type in [ButtonType.accelCruise, ButtonType.decelCruise] and not b.pressed:
+        events.add(EventName.buttonEnable)
+      # do disable on button down
+      if b.type == ButtonType.cancel and b.pressed:
+        events.add(EventName.buttonCancel)
 
+    ret.events = events.to_msg()
+
+    # copy back carState packet to CS
+    self.CS.out = ret.as_reader()
+
+    return self.CS.out
+
+    events = self.create_common_events(ret, pcm_enable=False)
+
+    if ret.vEgo < self.CP.minEnableSpeed:
+      events.add(EventName.belowEngageSpeed)
+    if self.CS.park_brake:
+      events.add(EventName.parkBrake)
+    if ret.cruiseState.standstill:
+      events.add(EventName.resumeRequired)
+    if self.CS.pcm_acc_status == AccState.FAULTED:
+      events.add(EventName.controlsFailed)
+    if ret.vEgo < self.CP.minSteerSpeed:
+      events.add(car.CarEvent.EventName.belowSteerSpeed)
     # handle button presses
     for b in ret.buttonEvents:
       # do enable on both accel and decel buttons

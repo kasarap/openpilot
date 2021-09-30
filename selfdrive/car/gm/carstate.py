@@ -5,8 +5,9 @@ from opendbc.can.can_define import CANDefine
 from opendbc.can.parser import CANParser
 from selfdrive.car.interfaces import CarStateBase
 from selfdrive.car.gm.values import DBC, CAR, AccState, CanBus, \
-                                    CruiseButtons, STEER_THRESHOLD
-
+                                    CruiseButtons, STEER_THRESHOLD, CAR
+from selfdrive.kegman_conf import kegman_conf
+kegman = kegman_conf()
 
 class CarState(CarStateBase):
   def __init__(self, CP):
@@ -14,11 +15,28 @@ class CarState(CarStateBase):
     can_define = CANDefine(DBC[CP.carFingerprint]['pt'])
     self.shifter_values = can_define.dv["ECMPRDNL"]["PRNDL"]
 
+    self.prev_distance_button = 0
+    self.prev_lka_button = 0
+    self.lka_button = 0
+    self.distance_button = 0
+    self.follow_level = 2
+    self.lkMode = True
+    self.autoHold = False
+    self.autoHoldActive = False
+    self.autoHoldActivated = False
+    self.regenPaddlePressed = 0
+    self.cruiseMain = False
+    self.engineRPM = 0
+
   def update(self, pt_cp):
     ret = car.CarState.new_message()
 
     self.prev_cruise_buttons = self.cruise_buttons
     self.cruise_buttons = pt_cp.vl["ASCMSteeringButton"]['ACCButtons']
+    self.prev_lka_button = self.lka_button
+    self.lka_button = pt_cp.vl["ASCMSteeringButton"]["LKAButton"]
+    self.prev_distance_button = self.distance_button
+    self.distance_button = pt_cp.vl["ASCMSteeringButton"]["DistanceButton"]
 
     ret.wheelSpeeds.fl = pt_cp.vl["EBCMWheelSpdFront"]['FLWheelSpd'] * CV.KPH_TO_MS
     ret.wheelSpeeds.fr = pt_cp.vl["EBCMWheelSpdFront"]['FRWheelSpd'] * CV.KPH_TO_MS
@@ -78,6 +96,11 @@ class CarState(CarStateBase):
 
     return ret
 
+
+  def get_follow_level(self):
+    return self.follow_level
+
+
   @staticmethod
   def get_can_parser(CP):
     # this function generates lists for signal, messages and initial values
@@ -107,8 +130,10 @@ class CarState(CarStateBase):
       ("TractionControlOn", "ESPStatus", 0),
       ("EPBClosed", "EPBStatus", 0),
       ("CruiseMainOn", "ECMEngineStatus", 0),
-      ("ACCCmdActive", "ASCMActiveCruiseControlStatus", 0),
-      ("LKATotalTorqueDelivered", "PSCMStatus", 0),
+      ("LKAButton", "ASCMSteeringButton", 0),
+      ("DistanceButton", "ASCMSteeringButton", 0),
+      ("LKATorqueDelivered", "PSCMStatus", 0),
+      ("EngineRPM", "ECMEngineStatus", 0),
     ]
 
     if CP.carFingerprint == CAR.VOLT or CP.carFingerprint == CAR.BOLT:
